@@ -1,0 +1,141 @@
+package br.com.igti.data.rdp;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.api.java.function.Function;
+import org.apache.spark.broadcast.Broadcast;
+import org.apache.spark.ml.Pipeline;
+import org.apache.spark.ml.PipelineModel;
+import org.apache.spark.ml.PipelineStage;
+import org.apache.spark.ml.clustering.KMeans;
+import org.apache.spark.ml.clustering.KMeansModel;
+import org.apache.spark.ml.feature.LabeledPoint;
+import org.apache.spark.ml.linalg.Vector;
+import org.apache.spark.ml.linalg.Vectors;
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.RowFactory;
+import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
+import org.apache.spark.util.DoubleAccumulator;
+import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.SparkConf;
+
+import static org.apache.spark.sql.functions.*;
+
+public class AutoModelKMeans { 
+
+	public static void main(String[] args) {
+		SparkConf conf = new SparkConf().setAppName("autocluster").setMaster("local");
+		JavaSparkContext spContext = new JavaSparkContext(conf);
+		SparkSession spSession = SparkSession.builder().appName("autocluster")
+		.master("local").getOrCreate();
+
+		Dataset<Row> autoDs = spSession.read().option("header","true")
+				.csv("data/lxv-auto-data.csv");
+
+		StructType autoSchema = DataTypes
+				.createStructType(new StructField[] {
+					DataTypes.createStructField("DOORS", DataTypes.DoubleType, false),
+					DataTypes.createStructField("BODY", DataTypes.DoubleType, false),
+					DataTypes.createStructField("HP", DataTypes.DoubleType, false),
+					DataTypes.createStructField("RPM", DataTypes.DoubleType, false),
+					DataTypes.createStructField("MPG", DataTypes.DoubleType, false) 
+		});
+		 
+		// cria um novo RDD repartindo o arquivo orginal em duas partições
+		JavaRDD<Row> rdd1 = autoDs.toJavaRDD().repartition(2);
+				
+		//transformação dos dados alterando as classes de saída para 0 e 1
+		JavaRDD<Row> rdd2 = rdd1.map( new Function<Row, Row>() {
+		    	@Override
+		    	public Row call(Row iRow) throws Exception {			
+				double doors = ( iRow.getString(3).equals("two") ? 1.0 : 2.0);
+				double body = ( iRow.getString(4).equals("sedan") ? 1.0 : 2.0);				
+				Row retRow = RowFactory.create( doors, body,
+							Double.valueOf(iRow.getString(7)),
+							Double.valueOf(iRow.getString(8)), 
+							Double.valueOf(iRow.getString(9)));				
+				return retRow;    
+		}});
+
+		// cria um novo dataFrame para os dados tansformados
+		Dataset<Row> autoDsTransf = spSession.createDataFrame(rdd2, autoSchema);
+
+		Row meanRow = autoDsTransf.agg(avg(autoDsTransf.col("DOORS")), 
+				avg(autoDsTransf.col("BODY")),
+				avg(autoDsTransf.col("HP")),
+				avg(autoDsTransf.col("RPM")),
+				avg(autoDsTransf.col("MPG")))
+			.toJavaRDD().takeOrdered(1).get(0);
+		
+		Row stdRow = autoDsTransf.agg(stddev(autoDsTransf.col("DOORS")), 
+				stddev(autoDsTransf.col("BODY")),
+				stddev(autoDsTransf.col("HP")),
+				stddev(autoDsTransf.col("RPM")),
+				stddev(autoDsTransf.col("MPG")))
+			.toJavaRDD().takeOrdered(1).get(0);
+
+		System.out.println("Valores Médios : " + meanRow);
+		System.out.println("Desvio Padrão : " + stdRow);
+		
+		final Broadcast<Row> bcMeanRow = spContext.broadcast(meanRow);
+		final Broadcast<Row> bcStdRow = spContext.broadcast(stdRow);
+		final DoubleAccumulator rowId = spContext.sc().doubleAccumulator();
+		rowId.setValue(1);
+				
+		JavaRDD<Row> rdd3 = autoDsTransf.toJavaRDD().repartition(2);
+		JavaRDD<LabeledPoint> rdd4 = rdd3.map(new Function<Row, LabeledPoint>() {
+				@Override
+				public LabeledPoint call(Row iRow) throws Exception {
+					double doors = (bcMeanRow.value().getDouble(0) - iRow.getDouble(0))
+										/ bcStdRow.value().getDouble(0);
+					double body =  (bcMeanRow.value().getDouble(1) - iRow.getDouble(1))
+									/ bcStdRow.value().getDouble(1);
+					double hp =  (bcMeanRow.value().getDouble(2) - iRow.getDouble(2))
+										/ bcStdRow.value().getDouble(2);
+					double rpm =  (bcMeanRow.value().getDouble(3) - iRow.getDouble(3))
+										/ bcStdRow.value().getDouble(3);
+					double mpg =  (bcMeanRow.value().getDouble(4) - iRow.getDouble(4))
+										/ bcStdRow.value().getDouble(4);	
+					double id= rowId.value();
+					rowId.setValue(rowId.value()+1);				
+					LabeledPoint lp = new LabeledPoint( id, Vectors.dense( doors, body, hp, rpm, mpg));
+					return lp;
+				}});
+        Dataset<Row> autoVector = 
+                spSession.createDataFrame(rdd4, LabeledPoint.class );
+		/*---------------------------------------------------------------
+		Treinamento
+		----------------------------------------------------------------*/
+		KMeans kmeans = new KMeans()
+							.setK(4)
+							.setSeed(1L);
+		
+		KMeansModel model = kmeans.fit(autoVector);
+		
+		/*--------------------------------------------------------------
+		Classificação
+		----------------------------------------------------------------*/
+		Dataset<Row> predictions = model.transform(autoVector);
+		predictions.show(5);		
+				
+		// mantem o programa ativo aguardando durante um tempo
+		while (true) {
+			try {
+				Thread.sleep(1000);
+			} catch (InterruptedException e) {				
+				e.printStackTrace();
+			}
+		}
+
+	}
+}
+
+	
+	
